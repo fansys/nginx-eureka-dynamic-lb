@@ -17,6 +17,8 @@ local _M = new_tab(0, 100)
 
 _M.VERSION = "0.0.1"
 
+_DEFULT_ZONE = 'DEFAULT'
+
 local mt = { __index = _M }
 
 local default_dict_name = "eureka_balancer"
@@ -46,8 +48,8 @@ function split(s, p)
 end
 
 -- build eureka service uri
-local function build_eureka_uri(eureka_url_index)
-    local uri = _M.eureka_service_urls[eureka_url_index]
+local function build_eureka_uri(zone, eureka_url_index)
+    local uri = _M[zone..'eureka_service_urls'][eureka_url_index]
     local ipAddr = split(uri, ":")
     local ip = ipAddr[1]
     local port = ipAddr[2]
@@ -55,10 +57,10 @@ local function build_eureka_uri(eureka_url_index)
 end
 
 -- build eureka request params
-local function build_eureka_params(service_name)
+local function build_eureka_params(zone, service_name)
     local uri = "/eureka/apps/" .. service_name
     local headers = {["Accept"]="application/json"}
-    local eureka_service_basic_authentication = _M.eureka_service_basic_authentication
+    local eureka_service_basic_authentication = _M[zone..'eureka_service_basic_authentication']
     if eureka_service_basic_authentication then
         local basic_authentication = "Basic " .. eureka_service_basic_authentication
         headers = {["Accept"]="application/json", ["Authorization"]=basic_authentication}
@@ -67,8 +69,8 @@ local function build_eureka_params(service_name)
     return params
 end
 
-local function incr_eureka_url_index(eureka_url_index)
-    if eureka_url_index >= #_M.eureka_service_urls then
+local function incr_eureka_url_index(zone, eureka_url_index)
+    if eureka_url_index >= #_M[zone..'eureka_service_urls'] then
         eureka_url_index = 1
     else
         eureka_url_index = eureka_url_index + 1
@@ -107,116 +109,119 @@ local function parse_service(body)
 end
 
 -- cache service to ngx shared dict
-local function cache_service(service_name, service)
+local function cache_service(zone, service_name, service)
     if not _M.shared_cache then
         return nil
     end
-    ngx.log(ngx.INFO, "eureka.balancer: cache service to ngx shared: ", service_name, " ", json.encode(service))
-    _M.shared_cache:set(service_name, json.encode(service))
+    ngx.log(ngx.INFO, get_zone_info(zone).."eureka.balancer: cache service to ngx shared: ", service_name, " ", json.encode(service))
+    _M.shared_cache:set(zone..service_name, json.encode(service))
 end
 
 -- get service from ngx shared dict
-local function aquire_service(service_name)
+local function aquire_service(zone, service_name)
     if not _M.shared_cache then
         return nil
     end
-    local service_json = _M.shared_cache:get(service_name)
+    local service_json = _M.shared_cache:get(zone..service_name)
 
-    ngx.log(ngx.INFO, "eureka.balancer: aquire service from ngx shared: service_name: ", service_name, " ", service_json)
+    ngx.log(ngx.INFO, get_zone_info(zone).."eureka.balancer: aquire service from ngx shared: service_name: ", service_name, " ", service_json)
 
     return service_json and json.decode(service_json) or nil
 end
 
 -- only update upstreams if service already exist (round robin cursor)
-local function cache_service_upstreams(service_name, service)
+local function cache_service_upstreams(zone, service_name, service)
     if not _M.shared_cache then
         return nil
     end
-    ngx.log(ngx.INFO, "eureka.balancer: cache service upstreams to ngx shared: ", service_name, " ", json.encode(service))
+    ngx.log(ngx.INFO, get_zone_info(zone).."eureka.balancer: cache service upstreams to ngx shared: ", service_name, " ", json.encode(service))
 
-    local cached_service = aquire_service(service_name)
+    local cached_service = aquire_service(zone, service_name)
     if cached_service ~= nil then
         cached_service.upstreams = service.upstreams
-        cache_service(service_name, cached_service)
+        cache_service(zone, service_name, cached_service)
     else
-        cache_service(service_name, service)
+        cache_service(zone, service_name, service)
     end
 end
 
 -- refresh service from eureka
-local function refresh_service(service_name, eureka_url_index)
+local function refresh_service(zone, service_name, eureka_url_index)
     local httpc = http:new()
     --connect_timeout, send_timeout, read_timeout (in ms)
     httpc:set_timeouts(3000, 10000, 10000)
-    local params = build_eureka_params(service_name)
-    local s_ip, s_port = build_eureka_uri(eureka_url_index)
+    local params = build_eureka_params(zone, service_name)
+    local s_ip, s_port = build_eureka_uri(zone, eureka_url_index)
 
-    ngx.log(ngx.INFO, "eureka.balancer: refresh_service : ", eureka_url_index, " ", s_ip, ":", s_port)
+    ngx.log(ngx.INFO, get_zone_info(zone).."eureka.balancer: refresh_service : ", eureka_url_index, " ", s_ip, ":", s_port)
 
     local ok, err = httpc:connect(s_ip, s_port)
     if err ~= nil then
-        ngx.log(ngx.ERR, "eureka.balancer: failed to connect eureka server: ", s_ip, ":", s_port, " ", err)
+        ngx.log(ngx.ERR, get_zone_info(zone).."eureka.balancer: failed to connect eureka server: ", s_ip, ":", s_port, " ", err)
         return nil, err
     end
 
     local res, err = httpc:request(params)
     if err ~= nil then
-        ngx.log(ngx.ERR, "eureka.balancer: failed to request eureka server: ", s_ip, ":", s_port, " ", err)
+        ngx.log(ngx.ERR, get_zone_info(zone).."eureka.balancer: failed to request eureka server: ", s_ip, ":", s_port, " ", err)
         return nil, err
     end
 
     if res.status ~= 200 then
-        return nil, "bad response code: " .. res.status
+        return nil, get_zone_info(zone).."bad response code: " .. res.status
     end
 
     local body = res:read_body()
     local service, err = parse_service(body)
     if err ~= nil then
-        ngx.log(ngx.ERR, "eureka.balancer: failed to parse eureka service response: ", s_ip, ":", s_port, " ", err)
+        ngx.log(ngx.ERR, get_zone_info(zone).."eureka.balancer: failed to parse eureka service response: ", s_ip, ":", s_port, " ", err)
         return nil, err
     end
 
     local ok, err = httpc:set_keepalive(http_max_idle_timeout, http_pool_size)
     --local ok, err = httpc:set_keepalive()
     if err ~= nil then
-        ngx.log(ngx.ERR, "eureka.balancer: failed to set keepalive for http client: ", err)
+        ngx.log(ngx.ERR, get_zone_info(zone).."eureka.balancer: failed to set keepalive for http client: ", err)
     end
     return service
 end
 
 
-local function watch(premature, service_name, eureka_url_index)
+local function watch(premature, zone, service_name, eureka_url_index)
     if premature then
         return nil
     end
 
     eureka_url_index = eureka_url_index or 1
 
-    local service, err = refresh_service(service_name, eureka_url_index)
+    local service, err = refresh_service(zone, service_name, eureka_url_index)
     if err ~= nil then
-        ngx.log(ngx.ERR, "eureka.balancer: failed watching service: ", service_name)
+        ngx.log(ngx.ERR, get_zone_info(zone).."eureka.balancer: failed watching service: ", service_name)
 
-        eureka_url_index = incr_eureka_url_index(eureka_url_index)
+        eureka_url_index = incr_eureka_url_index(zone, eureka_url_index)
 
-        ngx.log(ngx.ERR, "eureka.balancer: failed watching service eureka_url_index: ", eureka_url_index)
+        ngx.log(ngx.ERR, get_zone_info(zone).."eureka.balancer: failed watching service eureka_url_index: ", eureka_url_index)
 
-        _timer(refresh_retry_idle_time, watch, service_name, eureka_url_index)
+        _timer(refresh_retry_idle_time, watch, zone, service_name, eureka_url_index)
         return nil
     end
 
     service.name = service_name
-    cache_service_upstreams(service_name, service)
+    cache_service_upstreams(zone, service_name, service)
 
-    _timer(watch_refresh_idle_time, watch, service_name, eureka_url_index)
+    _timer(watch_refresh_idle_time, watch, zone, service_name, eureka_url_index)
 end
 
 -- watch services
-function _M.watch_service(service_list)
+function _M.watch_service(service_list, zone)
+    if (zone == nil) then
+        zone = _DEFULT_ZONE
+    end
     if ngx.worker.id() > 0 then
         return
     end
     for k,v in pairs(service_list) do
-        _timer(0, watch, v, 1)
+        _timer(0, watch, zone, v, 1)
     end
 end
 
@@ -235,14 +240,17 @@ local function incr_service_cursor(service)
 end
 
 --round_robin
-function _M.round_robin(service_name)
-    local service = aquire_service(service_name)
+function _M.round_robin(service_name, zone)
+    if (zone == nil) then
+        zone = _DEFULT_ZONE
+    end
+    local service = aquire_service(zone, service_name)
     if service == nil then
-        ngx.log(ngx.ERR, "eureka.balancer: service not found: ", service_name)
+        ngx.log(ngx.ERR, get_zone_info(zone).."eureka.balancer: service not found: ", service_name)
         return ngx.exit(500)
     end
     if service.upstreams == nil or #service.upstreams == 0 then
-        ngx.log(ngx.ERR, "eureka.balancer: no peers for service: ", service_name)
+        ngx.log(ngx.ERR, get_zone_info(zone).."eureka.balancer: no peers for service: ", service_name)
         return ngx.exit(500)
     end
 
@@ -256,25 +264,28 @@ function _M.round_robin(service_name)
     local backend_server = service.upstreams[service.cursor]
 
     -- update service cursor
-    cache_service(service_name, service)
+    cache_service(zone, service_name, service)
 
     local ok, err = balancer.set_current_peer(backend_server["ip"], backend_server["port"])
     if not ok then
-        ngx.log(ngx.ERR, "eureka.balancer: failed to set the current peer: ", err)
+        ngx.log(ngx.ERR, get_zone_info(zone).."eureka.balancer: failed to set the current peer: ", err)
         return ngx.exit(500)
     end
 end
 
 --ip_hash
-function _M.ip_hash(service_name)
-    local service = aquire_service(service_name)
+function _M.ip_hash(service_name, zone)
+    if (zone == nil) then
+        zone = _DEFULT_ZONE
+    end
+    local service = aquire_service(zone, service_name)
     if service == nil then
-        ngx.log(ngx.ERR, "eureka.balancer: service not found: ", service_name)
+        ngx.log(ngx.ERR, get_zone_info(zone).."eureka.balancer: service not found: ", service_name)
         return ngx.exit(500)
     end
     local bs_size = #service.upstreams
     if service.upstreams == nil or bs_size == 0 then
-        ngx.log(ngx.ERR, "eureka.balancer: no peers for service: ", service_name)
+        ngx.log(ngx.ERR, get_zone_info(zone).."eureka.balancer: no peers for service: ", service_name)
         return ngx.exit(500)
     end
 
@@ -287,7 +298,7 @@ function _M.ip_hash(service_name)
     local backend_server = service.upstreams[index]
     local ok, err = balancer.set_current_peer(backend_server["ip"], backend_server["port"])
     if not ok then
-        ngx.log(ngx.ERR, "eureka.balancer: failed to set the current peer: ", err)
+        ngx.log(ngx.ERR, get_zone_info(zone).."eureka.balancer: failed to set the current peer: ", err)
         return ngx.exit(500)
     end
 end
@@ -302,18 +313,32 @@ local function set_shared_dict_name(dict_name)
     end
 end
 
+function get_zone_info(zone)
+    if (string.upper(zone)==_DEFULT_ZONE) then
+        return ""
+    else
+        return "["..zone.."] "
+    end
+end
+
 -- set eureka service urls
-function _M.set_eureka_service_url(eureka_service_urls)
-    _M.eureka_service_urls = eureka_service_urls
-    if not _M.eureka_service_urls then
-        ngx.log(ngx.ERR, "eureka.balancer: require set eureka_service_urls")
+function _M.set_eureka_service_url(eureka_service_urls, zone)
+    if (zone == nil) then
+        zone = _DEFULT_ZONE
+    end
+    _M[zone..'eureka_service_urls'] = eureka_service_urls
+    if not _M[zone..'eureka_service_urls'] then
+        ngx.log(ngx.ERR, get_zone_info(zone).."eureka.balancer: require set eureka_service_urls")
         return ngx.exit(ngx.ERROR)
     end
 end
 
 -- set eureka basic authentication info
-function _M.set_eureka_service_basic_authentication(eureka_service_basic_authentication)
-    _M.eureka_service_basic_authentication = eureka_service_basic_authentication
+function _M.set_eureka_service_basic_authentication(eureka_service_basic_authentication, zone)
+    if (zone == nil) then
+        zone = _DEFULT_ZONE
+    end
+    _M[zone..'eureka_service_basic_authentication'] = eureka_service_basic_authentication
 end
 
 function _M.new(self, opts)

@@ -103,3 +103,101 @@ http {
 	}
 }
 ```
+
+## 支持多zone
+增加 `zone` 参数，支持多区域的负载均衡
+```
+
+http {
+	#sharing cache area
+	lua_shared_dict dynamic_eureka_balancer 128m;
+
+	init_worker_by_lua_block {
+		-- init eureka balancer
+		local file = require "resty.dynamic_eureka_balancer"
+		local balancer = file:new({dict_name="dynamic_eureka_balancer"})
+		
+		--eureka server list, zone: DEV,UAT
+		balancer.set_eureka_service_url({"127.0.0.1:6666", "127.0.0.1:7777"}, 'DEV')
+		balancer.set_eureka_service_url({"127.0.0.1:8888", "127.0.0.1:9999"}, 'UAT')
+		
+		--eureka basic authentication, zone: DEV,UAT
+		--use this setting if eureka has enabled basic authentication. 
+		--note: basic authentication must use BASE64 encryption in `user:password` format
+        --balancer.set_eureka_service_basic_authentication("", 'DEV')
+		--balancer.set_eureka_service_basic_authentication("", 'UAT')
+		
+		--The service name that needs to be monitored, zone: DEV,UAT
+		balancer.watch_service({"zuul", "client"}, 'DEV')
+		balancer.watch_service({"zuul", "client"}, 'UAT')
+	}
+	
+	upstream springcloud_cn_dev {
+		server 127.0.0.1:666; # Required, because empty upstream block is rejected by nginx (nginx+ can use 'zone' instead)
+		
+		balancer_by_lua_block {    
+		
+			--The zuul name that needs to be monitored
+			local service_name = "zuul"
+			
+			local file = require "resty.dynamic_eureka_balancer"
+			local balancer = file:new({dict_name="dynamic_eureka_balancer"}) 
+			
+			--balancer.ip_hash(service_name, 'DEV') --IP Hash LB, zone: DEV,UAT
+			balancer.round_robin(service_name, 'DEV') --Round Robin LB, zone: DEV,UAT
+		}
+	}
+	
+	upstream springcloud_cn_uayt {
+		server 127.0.0.1:666; # Required, because empty upstream block is rejected by nginx (nginx+ can use 'zone' instead)
+		
+		balancer_by_lua_block {    
+		
+			--The zuul name that needs to be monitored
+			local service_name = "zuul"
+			
+			local file = require "resty.dynamic_eureka_balancer"
+			local balancer = file:new({dict_name="dynamic_eureka_balancer"}) 
+			
+			--balancer.ip_hash(service_name, 'UAT') --IP Hash LB
+			balancer.round_robin(service_name, 'UAT') --Round Robin LB
+		}
+	}
+
+    server {
+        listen       80;
+        server_name  dev.springcloud.cn;
+		
+		location / {
+			proxy_pass  http://springcloud_cn_dev/;
+			proxy_set_header Host $http_host;
+			proxy_set_header X-Real-IP $remote_addr;
+			proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+			proxy_set_header X-Forwarded-Proto  $scheme;
+		}
+
+        error_page   500 502 503 504  /50x.html;
+        location = /50x.html {
+            root   html;
+        }
+	}
+
+    server {
+        listen       80;
+        server_name  uat.springcloud.cn;
+		
+		location / {
+			proxy_pass  http://springcloud_cn_uat/;
+			proxy_set_header Host $http_host;
+			proxy_set_header X-Real-IP $remote_addr;
+			proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+			proxy_set_header X-Forwarded-Proto  $scheme;
+		}
+
+        error_page   500 502 503 504  /50x.html;
+        location = /50x.html {
+            root   html;
+        }
+	}
+}
+```
